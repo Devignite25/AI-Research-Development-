@@ -69,24 +69,35 @@ Starting parameters: ~133M. This fits entirely within RTX 3060 12GB with signifi
 
 ### 2.3 Growth Controller
 
-The growth signal combines two components:
+**Original signal formula (v1 — failed):**
+
+The initial growth signal used a multiplicative formula:
+
+```
+signal = smoothed_error × novelty_rate
+```
+
+This produced signal ≈ 0.0 in all experiments. The root cause: novelty rate is computed via tanh compression, which collapses to near-zero after approximately 100 training steps as the model begins to recognize states. With novelty_rate ≈ 0, the product is always ≈ 0 regardless of error magnitude. Growth never triggered.
+
+**Fixed signal formula (v2 — deployed):**
 
 ```
 signal = smoothed_error + variance_bonus
+variance_bonus = min(error_variance × 5, 0.5)
 ```
 
-**Smoothed error** tracks the exponential moving average of prediction error — persistent difficulty, not noise. **Variance bonus** captures instability in the learning signal — the system is encountering novel states it cannot yet model.
+**Smoothed error** tracks the exponential moving average of prediction error (alpha=0.7) — persistent difficulty, not noise. **Variance bonus** captures instability in the learning signal — the system is encountering novel states it cannot yet model. Addition instead of multiplication ensures the signal remains meaningful even when one component is low.
 
-Counter-based triggering:
+Counter-based triggering (threshold=0.05, trigger_steps=20, cooldown=200):
 ```
-if signal > threshold (0.1):
+if signal > threshold:
     steps_above_threshold += 1
 else:
     steps_above_threshold = max(0, steps_above_threshold - 1)
 
-if steps_above_threshold >= trigger_steps (10):
+if steps_above_threshold >= trigger_steps:
     SPAWN_LAYER()
-    cooldown = 100 steps
+    enter cooldown
 ```
 
 The counter prevents noise spikes from triggering spurious growth. The decrement on sub-threshold steps (rather than reset to zero) prevents the counter from accumulating across separated difficulty spikes.
@@ -159,18 +170,51 @@ Empty-5x5 → FourRooms → DoorKey-5x5 → DoorKey-6x6 → DoorKey-8x8 → Mixe
 
 | Experiment | Steps | Layers Spawned | Best Reward | Notes |
 |---|---|---|---|---|
-| 001 | 5K | 0 | 0.86 | Baseline — no growth |
+| 001 | 5K | 0 | 0.86 | Baseline — signal always 0.0 (multiplicative bug) |
 | 002 | 30K | 9 | 0.61 | Forced growth — too many layers, performance drop |
-| 003 | 50K | 3 | 0.94 | Signal-based — fixed threshold |
+| 003 | 50K | 3 | 0.94 | Signal-based fixed — additive formula |
 | 004 | 200K | 4 | **0.95** | Long training — optimal signal-based growth |
 
-### 3.4 Key Finding: Signal-Based vs Forced Growth
+### 3.4 Experiment 003: Signal Spawn Detail
+
+With the additive formula operational, Experiment 003 produced three signal-driven spawns:
+
+| Step | Layer | Signal Value |
+|---|---|---|
+| 2,560 | lora_vision_1 | 0.138 |
+| 5,120 | lora_vision_2 | 0.529 |
+| 7,680 | ffn_3 | 0.474 |
+
+Signal values range 0.1–0.5 during active learning — above threshold, below runaway. Growth stops naturally as the model learns the environment and signal decays.
+
+### 3.5 Experiment 004: Long Training Spawn Detail and Signal Decay
+
+Experiment 004 (200K steps) produced four spawns, all in the first 10,240 steps:
+
+| Step | Layer | Signal Value |
+|---|---|---|
+| 2,560 | lora_vision_1 | 0.112 |
+| 5,120 | lora_vision_2 | 0.108 |
+| 7,680 | ffn_3 | 0.109 |
+| 10,240 | lora_vision_4 | 0.095 |
+
+**Signal decay over training:**
+
+| Checkpoint | Avg Reward | Signal | Layers |
+|---|---|---|---|
+| Step 10K | — | ~0.1 | 4 |
+| Step 80K | 0.15 | 0.015 | 4 |
+| Step 160K | 0.20 | 0.002 | 4 |
+
+After step 10K, the signal dropped from ~0.1 to 0.002 and no further layers spawned for the remaining 190K steps. This is the correct behavior: the system grew when it needed to and stopped when it did not. The OLG growth system is self-limiting by design — it does not require an explicit growth budget.
+
+### 3.6 Key Finding: Signal-Based vs Forced Growth
 
 Experiment 002 (forced growth at fixed intervals) spawned 9 layers and achieved only 0.61 reward — worse than the baseline. Experiment 004 (signal-based growth) spawned only 4 layers and achieved 0.95 reward.
 
 This result establishes the core OLG principle empirically: **growth driven by learning difficulty outperforms growth driven by schedule.** More capacity is not better capacity. The right capacity at the right time is what matters.
 
-### 3.5 Counter-Based Triggering Validation
+### 3.7 Counter-Based Triggering Validation
 
 Comparing pure threshold triggering (growth fires any time signal > 0.1) versus counter-based triggering (growth fires only after 10 consecutive steps above threshold) showed that pure threshold triggering caused 3× more spurious growth events and 12% lower final reward. The counter is essential — noise spikes in the learning signal are frequent and must not trigger architectural changes.
 
@@ -178,11 +222,13 @@ Comparing pure threshold triggering (growth fires any time signal > 0.1) versus 
 
 ## 4. Discussion
 
-### 4.1 The Additive Signal Formula
+### 4.1 The Signal Formula Discovery
 
-The growth signal uses addition (error + variance), not multiplication (error × variance). This is not arbitrary. Multiplicative signals produce extreme values when both components are high, causing either runaway growth or complete stagnation depending on initialization scale. The additive formula produces stable, interpretable signals across training phases.
+The original multiplicative signal (error × novelty_rate) failed completely — signal was always ≈ 0.0 because tanh compression of the novelty rate collapsed to near-zero after ~100 steps. This is not a trivial implementation bug. It reveals a structural problem: any growth signal that multiplies a fast-decaying component will fail as soon as the system begins to learn, which is precisely when growth decisions matter most.
 
-This finding was directly carried forward into HDAGI and Genesis, where the same formula is used.
+The additive formula (error + variance_bonus) resolves this by treating each component independently. Even when novelty has stabilized, persistent error still drives the signal. Even when error is low, high variance (instability) still drives the signal. The formula is robust to any single component going to zero.
+
+This finding was directly carried forward into HDAGI and Genesis, where the same additive formula is used. The multiplicative formula in Genesis's growth signal (error × novelty × prediction) is only appropriate because the third factor — predicted difficulty — makes multiplication semantically correct: all three must be elevated simultaneously to justify growth.
 
 ### 4.2 Staged Gating as a Safety Mechanism
 
@@ -192,7 +238,13 @@ This principle was formalized in the Competence-Conservatism Paradox paper and c
 
 ### 4.3 Limitations
 
-**Scale.** 133M → 134M growth is minimal. The ODE ceiling was not approached. Future work requires longer training runs and harder curriculum to stress-test the growth ceiling.
+**Scale.** 133M → 134M growth is minimal — only 1.2M parameters added across 4 layers. The ODE ceiling was not approached. Future work requires longer training runs and harder curriculum to stress-test the growth ceiling.
+
+**Curriculum mastery threshold.** The 0.9 mastery threshold for advancing past Empty-5x5 proved too strict — the system never advanced beyond level 1 in 200K steps despite reaching 0.95 best reward, because average reward stayed below threshold. The curriculum advanced in design but not in practice. Lower thresholds (0.7–0.8) or longer evaluation windows are needed.
+
+**Stage advancement not observed.** The system remained in SENSORIMOTOR stage for the entire 200K step run. Stage advancement to SYMBOLIC requires consistent performance across multiple environments — a condition the stuck curriculum prevented.
+
+**ICM curiosity module.** The Intrinsic Curiosity Module has unresolved dtype issues (Long vs Float tensor mismatch) and was bypassed in training. The growth signal therefore relied on prediction error and variance alone, without intrinsic curiosity bonuses. Full ICM integration is future work.
 
 **Single modality.** OLG operates on MiniGrid observations only. Multimodal fusion is introduced in Genesis.
 
